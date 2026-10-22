@@ -20,6 +20,7 @@ import os
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -40,6 +41,9 @@ UPLOAD_PATH = "/" + os.environ.get("UPLOAD_PATH", "/data/report").strip("/")
 # Campo de Ecowitt que se usa para la columna de lluvia (en pulgadas):
 #   dailyrainin (acumulada del día), hourlyrainin, rainratein, eventrainin...
 RAIN_FIELD = os.environ.get("RAIN_FIELD", "dailyrainin")
+# URLs a las que reenviar tal cual lo que manda el gateway (separadas por comas),
+# p. ej. el webhook de Home Assistant: http://192.168.1.10:8123/api/webhook/xxxx
+FORWARD_URLS = [u.strip() for u in os.environ.get("FORWARD_URLS", "").split(",") if u.strip()]
 
 lock = threading.Lock()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -142,6 +146,19 @@ def read_file():
             return b""
 
 
+# ---------------------------------------------------------------- reenvío
+def forward(raw, ctype):
+    """Reenvía el POST original a otros destinos (Home Assistant, etc.)."""
+    for url in FORWARD_URLS:
+        try:
+            req = urllib.request.Request(url, data=raw, method="POST",
+                                         headers={"Content-Type": ctype})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                r.read()
+        except Exception as e:  # un fallo aquí no debe afectar al resto
+            logging.warning("No se pudo reenviar a %s: %s", url, e)
+
+
 # ---------------------------------------------------------------- servidor HTTP
 def flatten(qs):
     return {k: v[0] for k, v in qs.items() if v}
@@ -192,13 +209,17 @@ class Handler(BaseHTTPRequestHandler):
         if u.path.rstrip("/") != UPLOAD_PATH.rstrip("/"):
             return self._send(404, "not found\n")
         length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(min(length, 65536)).decode("utf-8", "replace")
+        raw = self.rfile.read(min(length, 65536))
+        body = raw.decode("utf-8", "replace")
+        if FORWARD_URLS:
+            ctype = self.headers.get("Content-Type", "application/x-www-form-urlencoded")
+            threading.Thread(target=forward, args=(raw, ctype), daemon=True).start()
         params = flatten(parse_qs(u.query))
         params.update(flatten(parse_qs(body)))
         self._handle_upload(params)
 
 
 if __name__ == "__main__":
-    logging.info("Estación %s | escuchando en :%s | subida en %s | archivo %s",
-                 STATION_ID, PORT, UPLOAD_PATH, DATA_FILE)
+    logging.info("Estación %s | escuchando en :%s | subida en %s | archivo %s | reenvío a %d destino(s)",
+                 STATION_ID, PORT, UPLOAD_PATH, DATA_FILE, len(FORWARD_URLS))
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
